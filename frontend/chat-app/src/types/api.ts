@@ -103,6 +103,21 @@ export interface Workflow {
   stages: string[]
 }
 
+export interface WorkflowCreate {
+  workflow_id: string
+  name: string
+  description?: string
+}
+
+export interface WorkflowInfo {
+  workflow_id: string
+  name: string
+  description?: string
+  created_at: string
+  updated_at: string
+  stage_count: number
+  has_results: boolean
+}
 // =============================================================================
 // CHAT REQUEST TYPES (for API calls, not messages)
 // =============================================================================

@@ -14,7 +14,8 @@ import type {
   RAGStats,
   HealthResponse,
   Document,
-  Workflow,
+  WorkflowInfo,
+  WorkflowCreate,
   DataFileUploadResponse,
   WorkflowImages,
   StageFiles,
@@ -208,8 +209,15 @@ export const workflowApi = {
     return apiFetch(`/workflow/status/${taskId}`)
   },
   
-  async listWorkflows(): Promise<Workflow[]> {
-    return apiFetch<Workflow[]>('/workflow/list')
+  async listWorkflows(): Promise<WorkflowInfo[]> {
+    return apiFetch<WorkflowInfo[]>('/workflow/list')
+  },
+
+  async createWorkflow(data: WorkflowCreate): Promise<WorkflowInfo> {
+    return apiFetch<WorkflowInfo>('/workflow/create', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    })
   },
   
   async uploadData(

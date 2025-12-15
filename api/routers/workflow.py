@@ -14,7 +14,7 @@ from pathlib import Path
 from fastapi import UploadFile, File
 from datetime import datetime
 from typing import Optional, Dict, Any, Annotated
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Depends, status
 from loguru import logger
 
 from langchain.messages import HumanMessage, AIMessage
@@ -24,6 +24,7 @@ from schemas import (
     WorkflowResponse,
     WorkflowMessage,
     WorkflowStatus,
+    WorkflowCreate,
     ErrorResponse,
     DataFileUploadResponse
 )
@@ -480,27 +481,131 @@ async def list_workflow_stages(workflow_id: str) -> list:
     return stages
 
 
+# @router.get(
+#     "/list",
+#     summary="List all workflows",
+# )
+# async def list_workflows() -> list:
+#     """List all available workflows."""
+#     from pathlib import Path
+
+#     results_dir = Path(settings.RESULTS_DIR)
+#     if not results_dir.exists():
+#         return []
+
+#     workflows = []
+#     for workflow_dir in sorted(results_dir.iterdir()):
+#         if workflow_dir.is_dir():
+#             stage_count = len([d for d in workflow_dir.iterdir() if d.is_dir()])
+#             workflows.append(
+#                 {
+#                     "workflow_id": workflow_dir.name,
+#                     "stage_count": stage_count,
+#                 }
+#             )
+
+#     return workflows
+
+
 @router.get(
     "/list",
+    response_model=list,  # Will be list[WorkflowInfo]
     summary="List all workflows",
 )
 async def list_workflows() -> list:
-    """List all available workflows."""
-    from pathlib import Path
-
+    """
+    List all workflows from database.
+    
+    Merges database metadata with filesystem stage counts.
+    """
+    from database import get_workflow_db
+    
+    db = get_workflow_db()
     results_dir = Path(settings.RESULTS_DIR)
-    if not results_dir.exists():
-        return []
-
+    
+    # Sync any new filesystem workflows
+    db.sync_filesystem(settings.RESULTS_DIR)
+    
     workflows = []
-    for workflow_dir in sorted(results_dir.iterdir()):
-        if workflow_dir.is_dir():
+    for record in db.list_all():
+        workflow_dir = results_dir / record.workflow_id
+        
+        # Count stages from filesystem
+        stage_count = 0
+        has_results = False
+        if workflow_dir.exists():
+            has_results = True
             stage_count = len([d for d in workflow_dir.iterdir() if d.is_dir()])
-            workflows.append(
-                {
-                    "workflow_id": workflow_dir.name,
-                    "stage_count": stage_count,
-                }
-            )
-
+        
+        workflows.append({
+            "workflow_id": record.workflow_id,
+            "name": record.name,
+            "description": record.description,
+            "created_at": record.created_at,
+            "updated_at": record.updated_at,
+            "stage_count": stage_count,
+            "has_results": has_results,
+        })
+    
     return workflows
+
+@router.post(
+    "/create",
+    response_model=dict,  # Will be WorkflowInfo
+    status_code=status.HTTP_201_CREATED,
+    summary="Create a new workflow",
+)
+async def create_workflow(
+    request: WorkflowCreate,  # Import from schemas
+    current_user: Annotated["User", Depends(get_current_active_user)],
+) -> dict:
+    """
+    Create a new workflow.
+    
+    Creates database record and optional results directory.
+    """
+    from database import get_workflow_db
+    import re
+    
+    
+    # Validate workflow_id format
+    if not re.match(r"^[a-zA-Z0-9_-]+$", request.workflow_id):
+        raise HTTPException(
+            status_code=400,
+            detail="workflow_id must contain only letters, numbers, hyphens, and underscores",
+        )
+    
+    db = get_workflow_db()
+    
+    # Check if exists
+    if db.exists(request.workflow_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Workflow '{request.workflow_id}' already exists",
+        )
+    
+    # Create database record
+    try:
+        record = db.create(
+            workflow_id=request.workflow_id,
+            name=request.name,
+            description=request.description,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    
+    # Create results directory
+    results_dir = Path(settings.RESULTS_DIR) / request.workflow_id
+    results_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info(f"📁 Created workflow: {request.workflow_id} by {current_user.username}")
+    
+    return {
+        "workflow_id": record.workflow_id,
+        "name": record.name,
+        "description": record.description,
+        "created_at": record.created_at,
+        "updated_at": record.updated_at,
+        "stage_count": 0,
+        "has_results": False,
+    }

@@ -611,6 +611,7 @@ class ContextRAG:
                 cleaned[key] = str(value)
         
         return cleaned
+    
     def _process_batch(self, batch, doc_type: str) -> None:
         """Process and add a batch of chunks to the collection."""
         documents = []
@@ -1186,7 +1187,14 @@ class ContextRAG:
         except Exception as e:
             logger.error(f"❌ Failed to get stats: {e}")
             return {"enabled": True, "error": str(e)}
-    
+    def add(
+            self,
+            content: str,
+            *args,
+            metadata: Optional[Dict[str, Any]] = None
+    ):
+        ...
+
     def add_document(
         self,
         content: str,

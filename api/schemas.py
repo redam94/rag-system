@@ -259,3 +259,22 @@ class ErrorResponse(BaseModel):
 
     detail: str
     error_type: Optional[str] = None
+
+
+# =============================================================================
+# DATABASE MODELS
+# =============================================================================
+
+class WorkflowCreate(BaseModel):
+    workflow_id: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=128)
+    description: Optional[str] = Field(default=None, max_length=512)
+
+class WorkflowInfo(BaseModel):
+    workflow_id: str
+    name: str
+    description: Optional[str] = None
+    created_at: str
+    updated_at: str
+    stage_count: int = 0
+    has_results: bool = False
