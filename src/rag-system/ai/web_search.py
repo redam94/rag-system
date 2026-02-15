@@ -151,7 +151,7 @@ class SearchAgent:
         if not self.llm:
             # Fallback: return the original query
             return SearchQueries(
-                queries=[f"{user_query} python data science"],
+                queries=[user_query],
                 reasoning="LLM not available, using basic query"
             )
         
@@ -160,7 +160,7 @@ class SearchAgent:
         
         structured_llm = self.llm.with_structured_output(SearchQueries)
         
-        prompt = f"""Generate optimized web search queries for a data science research task.
+        prompt = f"""Generate optimized web search queries to find information for the user's question.
 
 User's Question: {user_query}
 
@@ -169,15 +169,10 @@ Additional Context:
 
 Guidelines:
 - Create 2-4 specific, targeted search queries
-- Include technical terms and library names when relevant
+- Include relevant technical terms and domain-specific language when appropriate
 - One query should be broad, others more specific
-- Add "python" or specific library names for code-related queries
-- Focus on methodology, best practices, and implementation
-
-Examples of good queries:
-- "pandas groupby aggregation best practices"
-- "correlation analysis python statsmodels"
-- "feature importance random forest sklearn tutorial"
+- Focus on finding accurate, authoritative information
+- Vary query phrasing to maximize coverage
 """
         
         try:
@@ -241,10 +236,10 @@ Determine:
 3. If insufficient, what 1-2 refined queries would help?
 
 Consider:
-- Code examples / tutorials
-- Best practices / methodology
-- Specific library documentation
-- Common pitfalls / troubleshooting
+- Depth and accuracy of information found
+- Whether key aspects of the question are covered
+- Authoritative sources (official docs, reputable references)
+- Practical details or examples if relevant
 """
         
         try:
@@ -564,11 +559,11 @@ Available Results:
 {results_text}
 
 Selection Criteria:
-- Prioritize official documentation and tutorials
-- Prefer pages with code examples
-- Choose authoritative sources (official docs, reputable blogs)
+- Prioritize authoritative sources (official docs, reputable publications)
+- Prefer pages with detailed, in-depth content
+- Choose well-structured pages likely to have useful information
 - Avoid aggregator sites, forums with short answers
-- Prefer pages that likely have detailed methodology explanations
+- Prefer pages that directly address the query topic
 
 Return the indices of the {max_urls} best URLs to crawl."""
 
@@ -606,20 +601,20 @@ Return the indices of the {max_urls} best URLs to crawl."""
         def url_priority(r: SearchResult) -> float:
             score = r.score
             url = r.url.lower()
-            
-            # Boost official docs
-            if any(d in url for d in ['docs.', 'documentation', '.readthedocs.', 'scikit-learn.org', 'pandas.pydata.org']):
+
+            # Boost official docs and reference sites
+            if any(d in url for d in ['docs.', 'documentation', '.readthedocs.', 'wiki']):
                 score += 0.3
-            # Boost tutorials
-            if 'tutorial' in url or 'guide' in url:
+            # Boost tutorials and guides
+            if 'tutorial' in url or 'guide' in url or 'how-to' in url:
                 score += 0.2
-            # Boost educational
-            if any(d in url for d in ['towardsdatascience.com', 'realpython.com', 'geeksforgeeks.org']):
+            # Boost authoritative domains
+            if any(d in url for d in ['.edu', '.gov', '.org']):
                 score += 0.15
             # Penalize Q&A (usually short answers)
             if 'stackoverflow.com' in url or 'quora.com' in url:
                 score -= 0.1
-            
+
             return score
         
         sorted_results = sorted(crawlable, key=url_priority, reverse=True)
@@ -645,14 +640,8 @@ Return the indices of the {max_urls} best URLs to crawl."""
 # =============================================================================
 
 
-# Curated documentation sources for fallback
-DOC_SOURCES = {
-    "sklearn": "https://scikit-learn.org/stable/user_guide.html",
-    "pandas": "https://pandas.pydata.org/docs/user_guide/index.html",
-    "seaborn": "https://seaborn.pydata.org/tutorial.html",
-    "statsmodels": "https://www.statsmodels.org/stable/user-guide.html",
-    "matplotlib": "https://matplotlib.org/stable/tutorials/index.html",
-}
+# Curated documentation sources for fallback (general reference)
+DOC_SOURCES: Dict[str, str] = {}
 
 
 def search_duckduckgo(
@@ -726,22 +715,20 @@ async def search_duckduckgo_async(
 
 
 def select_doc_sources(query: str, max_sources: int = 2) -> List[str]:
-    """Select relevant documentation sources based on query keywords."""
+    """Select relevant documentation sources based on query keywords.
+
+    Returns matching URLs from DOC_SOURCES (if any are configured).
+    """
+    if not DOC_SOURCES:
+        return []
+
     q = query.lower()
     selected = []
-    
-    if any(k in q for k in ["model", "classify", "regress", "cluster", "predict", "sklearn"]):
-        selected.append(DOC_SOURCES["sklearn"])
-    if any(k in q for k in ["dataframe", "pandas", "merge", "groupby", "clean"]):
-        selected.append(DOC_SOURCES["pandas"])
-    if any(k in q for k in ["plot", "visual", "chart", "graph", "heatmap", "seaborn"]):
-        selected.append(DOC_SOURCES["seaborn"])
-    if any(k in q for k in ["statistic", "hypothesis", "anova", "ttest", "regression"]):
-        selected.append(DOC_SOURCES["statsmodels"])
-    
-    if not selected:
-        selected = [DOC_SOURCES["pandas"], DOC_SOURCES["sklearn"]]
-    
+
+    for keyword, url in DOC_SOURCES.items():
+        if keyword.lower() in q:
+            selected.append(url)
+
     return selected[:max_sources]
 
 
@@ -761,9 +748,10 @@ def extract_relevant(markdown: str, query: str, max_len: int = 1500) -> str:
         s_lower = section.lower()
         score = sum(1 for w in query_words if w in s_lower)
         
-        if "```" in section or "def " in section:
-            score += 3
-        if "example" in s_lower:
+        # Boost sections with structured content (code blocks, lists, examples)
+        if "```" in section or "- " in section:
+            score += 2
+        if "example" in s_lower or "summary" in s_lower:
             score += 2
             
         scored.append((score, section))
@@ -878,7 +866,7 @@ async def search_analytics_methods(
     
     try:
         results = await search_duckduckgo_async(
-            f"{query} python data science",
+            query,
             max_results=max_results,
             on_progress=on_progress
         )

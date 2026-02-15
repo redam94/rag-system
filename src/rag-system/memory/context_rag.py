@@ -612,21 +612,21 @@ class ContextRAG:
         
         return cleaned
     
-    def _process_batch(self, batch, doc_type: str) -> None:
-        """Process and add a batch of chunks to the collection."""
+    def _process_batch(self, batch, doc_type: str) -> List[str]:
+        """Process and add a batch of chunks to the collection. Returns generated IDs."""
         documents = []
         metadatas = []
         ids = []
-        
+
         for chunk in batch:
             chunk_text = chunk["text"]
             chunk_metadata = self._clean_metadata(chunk["metadata"])
             chunk_id = self._generate_id(chunk_text, doc_type, chunk["metadata"]["chunk_index"])
-            
+
             documents.append(chunk_text)
             metadatas.append(chunk_metadata)
             ids.append(chunk_id)
-        
+
         logger.debug(f"Adding {len(documents)} chunks to collection '{self.collection.name}'")
         logger.debug(f"Sample metadata: {metadatas[0] if metadatas else 'N/A'}")
         self.collection.add(
@@ -634,23 +634,23 @@ class ContextRAG:
             metadatas=metadatas,
             ids=ids
         )
+        return ids
 
     def _add_chunks_to_collection(
         self,
         chunks: List[Dict[str, Any]],
         doc_type: str
-    ):
-        """Helper to add chunks to collection."""
+    ) -> List[str]:
+        """Helper to add chunks to collection. Returns all generated chunk IDs."""
         if not chunks:
-            return
+            return []
+        all_ids: List[str] = []
         MAX_BATCH_SIZE = 1000
         for i in range(0, len(chunks), MAX_BATCH_SIZE):
             batch = chunks[i:i + MAX_BATCH_SIZE]
-            self._process_batch(batch, doc_type)
-        
-        remaining = chunks[len(chunks) - (len(chunks) % MAX_BATCH_SIZE):]
-        if remaining:
-            self._process_batch(remaining, doc_type)
+            batch_ids = self._process_batch(batch, doc_type)
+            all_ids.extend(batch_ids)
+        return all_ids
         
     
     def add_plot_analysis(
@@ -944,70 +944,216 @@ class ContextRAG:
         workflow_id: Optional[str] = None,
         stage_name: Optional[str] = None,
         doc_types: Optional[List[str]] = None,
+        document_titles: Optional[List[str]] = None,
         code_only: bool = False,
         n_results: int = 10
     ) -> List[Dict[str, Any]]:
         """
         Query for relevant context chunks.
-        
+
+        When question embeddings exist, they are transparently resolved to their
+        parent chunk content and deduplicated so callers always receive original
+        document text.
+
         Args:
             query: User query text
             workflow_id: Filter by workflow ID
             stage_name: Filter by stage name
             doc_types: Filter by document types (plot_analysis, code_execution, summary, web_result)
+            document_titles: Filter to only include chunks from these document titles
             code_only: If True, only return chunks with has_code=True
             n_results: Number of results to retrieve
-            
+
         Returns:
             List of relevant context chunks with metadata
         """
         if not self.enabled:
             return []
-        
+
         try:
-            # Build where filter
-            conditions = []
-            
-            if workflow_id:
-                conditions.append({"workflow_id": workflow_id})
-            if stage_name:
-                conditions.append({"stage_name": stage_name})
-            if doc_types:
-                conditions.append({"type": {"$in": doc_types}})
-            if code_only:
-                conditions.append({"has_code": True})
-            
-            where_filter = None
-            if len(conditions) == 1:
-                where_filter = conditions[0]
-            elif len(conditions) > 1:
-                where_filter = {"$and": conditions}
-            
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=n_results,
-                where=where_filter
-            )
-            
-            if not results['documents'] or not results['documents'][0]:
-                logger.info(f"🔍 No relevant context found for query")
+            # ------------------------------------------------------------------
+            # When document_titles is set we need results from BOTH regular
+            # chunks (title ∈ titles) AND question embeddings (parent_title ∈
+            # titles).  ChromaDB doesn't support OR across different fields
+            # natively, so we issue two queries and merge.
+            # ------------------------------------------------------------------
+            if document_titles:
+                raw_contexts = self._query_with_title_filter(
+                    query, workflow_id, stage_name, doc_types,
+                    document_titles, code_only, n_results,
+                )
+            else:
+                raw_contexts = self._query_single(
+                    query, workflow_id, stage_name, doc_types,
+                    code_only, n_results,
+                )
+
+            if not raw_contexts:
+                logger.info("🔍 No relevant context found for query")
                 return []
-            
-            contexts = []
-            for i, doc in enumerate(results['documents'][0]):
-                context = {
-                    "document": doc,
-                    "metadata": results['metadatas'][0][i],
-                    "distance": results['distances'][0][i] if 'distances' in results else None
-                }
-                contexts.append(context)
-            
-            logger.info(f"🔍 Retrieved {len(contexts)} relevant context chunks")
-            return contexts
-            
+
+            # Resolve question embeddings → parent chunk content
+            resolved = self._resolve_question_embeddings(raw_contexts)
+
+            logger.info(f"🔍 Retrieved {len(resolved)} relevant context chunks")
+            return resolved
+
         except Exception as e:
             logger.error(f"❌ Failed to query context: {e}")
             return []
+
+    # -- internal query helpers ------------------------------------------------
+
+    def _query_single(
+        self, query, workflow_id, stage_name, doc_types, code_only, n_results,
+    ) -> List[Dict[str, Any]]:
+        """Run a single ChromaDB query (no title filtering)."""
+        conditions = []
+        if workflow_id:
+            conditions.append({"workflow_id": workflow_id})
+        if stage_name:
+            conditions.append({"stage_name": stage_name})
+        if doc_types:
+            conditions.append({"type": {"$in": doc_types}})
+        if code_only:
+            conditions.append({"has_code": True})
+
+        where_filter = None
+        if len(conditions) == 1:
+            where_filter = conditions[0]
+        elif len(conditions) > 1:
+            where_filter = {"$and": conditions}
+
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=n_results,
+            where=where_filter,
+        )
+
+        if not results["documents"] or not results["documents"][0]:
+            return []
+
+        return [
+            {
+                "document": results["documents"][0][i],
+                "metadata": results["metadatas"][0][i],
+                "distance": results["distances"][0][i] if "distances" in results else None,
+            }
+            for i in range(len(results["documents"][0]))
+        ]
+
+    def _query_with_title_filter(
+        self, query, workflow_id, stage_name, doc_types, document_titles,
+        code_only, n_results,
+    ) -> List[Dict[str, Any]]:
+        """
+        Issue two queries — one for regular chunks filtered by title, one for
+        question embeddings filtered by parent_title — then merge by distance.
+        """
+        base_conditions = []
+        if workflow_id:
+            base_conditions.append({"workflow_id": workflow_id})
+        if stage_name:
+            base_conditions.append({"stage_name": stage_name})
+        if code_only:
+            base_conditions.append({"has_code": True})
+
+        # Query 1: regular chunks with title filter
+        conds1 = list(base_conditions)
+        if doc_types:
+            conds1.append({"type": {"$in": doc_types}})
+        conds1.append({"title": {"$in": document_titles}})
+
+        where1 = conds1[0] if len(conds1) == 1 else {"$and": conds1}
+        results1 = self.collection.query(
+            query_texts=[query], n_results=n_results, where=where1,
+        )
+
+        # Query 2: question embeddings with parent_title filter
+        conds2 = list(base_conditions)
+        conds2.append({"type": "question_embedding"})
+        conds2.append({"parent_title": {"$in": document_titles}})
+
+        where2 = conds2[0] if len(conds2) == 1 else {"$and": conds2}
+        results2 = self.collection.query(
+            query_texts=[query], n_results=n_results, where=where2,
+        )
+
+        # Merge both result sets
+        merged: List[Dict[str, Any]] = []
+        for results in (results1, results2):
+            if results["documents"] and results["documents"][0]:
+                for i in range(len(results["documents"][0])):
+                    merged.append({
+                        "document": results["documents"][0][i],
+                        "metadata": results["metadatas"][0][i],
+                        "distance": results["distances"][0][i] if "distances" in results else None,
+                    })
+
+        # Sort by distance (lower = more similar for cosine) and take top n
+        merged.sort(key=lambda x: x["distance"] if x["distance"] is not None else float("inf"))
+        return merged[:n_results]
+
+    def _resolve_question_embeddings(
+        self, contexts: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Replace question-embedding hits with their parent chunk content.
+        Deduplicates so each parent chunk appears at most once (best distance).
+        """
+        resolved: List[Dict[str, Any]] = []
+        seen_parent_ids: Dict[str, float] = {}  # parent_chunk_id → best distance
+        seen_chunk_ids: set = set()  # direct chunk IDs already included
+
+        # First pass: collect parent IDs we need to fetch
+        parent_ids_to_fetch: List[str] = []
+        for ctx in contexts:
+            if ctx["metadata"].get("type") == "question_embedding":
+                pid = ctx["metadata"].get("parent_chunk_id", "")
+                if pid and pid not in seen_parent_ids:
+                    parent_ids_to_fetch.append(pid)
+                    seen_parent_ids[pid] = ctx["distance"] if ctx["distance"] is not None else float("inf")
+                elif pid and ctx["distance"] is not None:
+                    seen_parent_ids[pid] = min(seen_parent_ids[pid], ctx["distance"])
+
+        # Batch-fetch all parent chunks
+        parent_map: Dict[str, Dict[str, Any]] = {}
+        if parent_ids_to_fetch:
+            try:
+                parent_results = self.collection.get(
+                    ids=parent_ids_to_fetch,
+                    include=["documents", "metadatas"],
+                )
+                for i, pid in enumerate(parent_results["ids"]):
+                    parent_map[pid] = {
+                        "document": parent_results["documents"][i],
+                        "metadata": parent_results["metadatas"][i],
+                    }
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to fetch parent chunks: {e}")
+
+        # Second pass: build resolved list
+        for ctx in contexts:
+            meta = ctx["metadata"]
+            if meta.get("type") == "question_embedding":
+                pid = meta.get("parent_chunk_id", "")
+                if pid in parent_map and pid not in seen_chunk_ids:
+                    parent = parent_map[pid]
+                    resolved.append({
+                        "document": parent["document"],
+                        "metadata": parent["metadata"],
+                        "distance": seen_parent_ids.get(pid, ctx["distance"]),
+                    })
+                    seen_chunk_ids.add(pid)
+            else:
+                # Regular chunk — check if already included via parent resolution
+                # We don't have the chunk ID here, so deduplicate by document content hash
+                doc_key = meta.get("title", "") + str(meta.get("chunk_index", ""))
+                if doc_key not in seen_chunk_ids:
+                    resolved.append(ctx)
+                    seen_chunk_ids.add(doc_key)
+
+        return resolved
     
     def query_code_context(
         self,
@@ -1051,21 +1197,23 @@ class ContextRAG:
         query: str,
         workflow_id: Optional[str] = None,
         stage_name: Optional[str] = None,
+        document_titles: Optional[List[str]] = None,
         max_tokens: int = 2000,
         max_chunks: int = 15
     ) -> str:
         """
         Get a concise context summary relevant to the query.
-        
+
         Combines relevant chunks into a focused context string.
         """
         if not self.enabled:
             return ""
-        
+
         contexts = self.query_relevant_context(
             query=query,
             workflow_id=workflow_id,
             stage_name=stage_name,
+            document_titles=document_titles,
             n_results=max_chunks
         )
         
@@ -1116,6 +1264,138 @@ class ContextRAG:
         logger.debug(f"Total context length: {total_length} characters")
         return "\n".join(context_parts)
     
+    # ── Question-embedding helpers ──────────────────────────────────────
+
+    def get_chunks_needing_questions(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Return content chunks that have not yet had question embeddings generated.
+
+        Includes both uploaded documents and web search results.
+        Returns a list of dicts with keys: id, text, metadata.
+        """
+        if not self.enabled:
+            return []
+
+        try:
+            # Find document and web_result chunks that do NOT have
+            # has_questions set.  ChromaDB doesn't support "field not
+            # exists" natively, so we query matching chunks and filter
+            # client-side.
+            total = self.collection.count()
+            results = self.collection.get(
+                where={"type": {"$in": ["document", "web_result"]}},
+                limit=min(limit * 5, max(total, 10000)),
+                include=["metadatas", "documents"],
+            )
+
+            if not results["ids"]:
+                return []
+
+            chunks = []
+            for i, cid in enumerate(results["ids"]):
+                meta = results["metadatas"][i]
+                if meta.get("has_questions"):
+                    continue
+                chunks.append({
+                    "id": cid,
+                    "text": results["documents"][i],
+                    "metadata": meta,
+                })
+                if len(chunks) >= limit:
+                    break
+
+            return chunks
+
+        except Exception as e:
+            logger.error(f"❌ Failed to get chunks needing questions: {e}")
+            return []
+
+    def add_question_embeddings(
+        self,
+        parent_chunk_id: str,
+        questions: List[str],
+        parent_metadata: Dict[str, Any],
+    ) -> List[str]:
+        """
+        Store generated questions as new ChromaDB entries linked to the parent chunk.
+
+        Each question becomes a separate document so ChromaDB auto-embeds it.
+        Returns the IDs of the newly added question entries.
+        """
+        if not self.enabled or not questions:
+            return []
+
+        try:
+            documents = []
+            metadatas = []
+            ids = []
+
+            parent_title = parent_metadata.get("title", "unknown")
+            parent_workflow = parent_metadata.get("workflow_id", "default")
+
+            for idx, question in enumerate(questions):
+                question = question.strip()
+                if not question:
+                    continue
+
+                q_id = self._generate_id(question, "question_embedding", idx)
+                q_meta = self._clean_metadata({
+                    "type": "question_embedding",
+                    "parent_chunk_id": parent_chunk_id,
+                    "parent_title": parent_title,
+                    "workflow_id": parent_workflow,
+                    "question_index": idx,
+                    "timestamp": datetime.now().isoformat(),
+                })
+
+                documents.append(question)
+                metadatas.append(q_meta)
+                ids.append(q_id)
+
+            if documents:
+                self.collection.add(
+                    documents=documents,
+                    metadatas=metadatas,
+                    ids=ids,
+                )
+                logger.debug(
+                    f"📝 Added {len(documents)} question embeddings "
+                    f"for chunk {parent_chunk_id[:8]}..."
+                )
+
+            return ids
+
+        except Exception as e:
+            logger.error(f"❌ Failed to add question embeddings: {e}")
+            return []
+
+    def mark_chunk_has_questions(self, chunk_id: str) -> bool:
+        """
+        Set has_questions=True on a chunk so it won't be reprocessed.
+
+        ChromaDB .update() replaces metadata entirely, so we must read first.
+        """
+        if not self.enabled:
+            return False
+
+        try:
+            result = self.collection.get(ids=[chunk_id], include=["metadatas"])
+            if not result["ids"]:
+                return False
+
+            meta = result["metadatas"][0]
+            meta["has_questions"] = True
+
+            self.collection.update(
+                ids=[chunk_id],
+                metadatas=[meta],
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ Failed to mark chunk {chunk_id}: {e}")
+            return False
+
     def delete_by_workflow(self, workflow_id: str):
         """Delete all documents for a specific workflow."""
         if not self.enabled:
@@ -1340,24 +1620,29 @@ class ContextRAG:
         """Get all uploaded/scraped documents."""
         if not self.enabled:
             return []
-        
+
         try:
             if workflow_id:
                 where_filter = {"$and": [{"type": "document"}, {"workflow_id": workflow_id}]}
             else:
                 where_filter = {"type": "document"}
-            
+
+            # Fetch all matching chunks.  We only need metadata (not
+            # embeddings or full text) to discover unique document titles,
+            # so request a generous limit.
+            total = self.collection.count()
             results = self.collection.get(
                 where=where_filter,
-                limit=500
+                limit=max(total, 10000),
+                include=["metadatas"],
             )
-            
-            if not results['documents']:
+
+            if not results['metadatas']:
                 return []
-            
+
             # Group by title/source to get unique documents
             docs = {}
-            for i, (doc, meta) in enumerate(zip(results['documents'], results['metadatas'])):
+            for i, meta in enumerate(results['metadatas']):
                 key = meta.get('title', '') + meta.get('url', '') + meta.get('source_path', '')
                 if key not in docs:
                     docs[key] = {
@@ -1373,9 +1658,9 @@ class ContextRAG:
                     }
                 docs[key]['chunk_count'] += 1
                 docs[key]['ids'].append(results['ids'][i])
-            
+
             return list(docs.values())
-            
+
         except Exception as e:
             logger.error(f"❌ Failed to get documents: {e}")
             return []
@@ -1405,6 +1690,97 @@ class ContextRAG:
             logger.error(f"❌ Failed to delete document: {e}")
             return False
     
+    def get_all_web_results(self, workflow_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get all stored web search results, grouped by unique title+URL."""
+        if not self.enabled:
+            return []
+
+        try:
+            if workflow_id:
+                where_filter = {"$and": [{"type": "web_result"}, {"workflow_id": workflow_id}]}
+            else:
+                where_filter = {"type": "web_result"}
+
+            total = self.collection.count()
+            results = self.collection.get(
+                where=where_filter,
+                limit=max(total, 10000),
+                include=["metadatas"],
+            )
+
+            if not results['metadatas']:
+                return []
+
+            # Group by title+url to get unique web results
+            web_results: Dict[str, Dict[str, Any]] = {}
+            for i, meta in enumerate(results['metadatas']):
+                key = meta.get('title', '') + '||' + meta.get('url', '')
+                if key not in web_results:
+                    web_results[key] = {
+                        'title': meta.get('title', 'Unknown'),
+                        'url': meta.get('url', ''),
+                        'search_query': meta.get('search_query', ''),
+                        'source': meta.get('source', ''),
+                        'enriched': meta.get('enriched', False),
+                        'timestamp': meta.get('timestamp'),
+                        'content_length': meta.get('content_length', 0),
+                        'chunk_count': 0,
+                        'workflow_id': meta.get('workflow_id'),
+                    }
+                web_results[key]['chunk_count'] += 1
+
+            return list(web_results.values())
+
+        except Exception as e:
+            logger.error(f"❌ Failed to get web results: {e}")
+            return []
+
+    def delete_web_results(
+        self,
+        items: List[Dict[str, str]],
+        workflow_id: Optional[str] = None,
+    ) -> int:
+        """Delete web results by title+url pairs.
+
+        Args:
+            items: List of dicts with 'title' and 'url' keys.
+            workflow_id: Optional workflow filter.
+
+        Returns:
+            Total number of chunks deleted.
+        """
+        if not self.enabled:
+            return 0
+
+        total_deleted = 0
+        try:
+            for item in items:
+                conditions: list = [
+                    {"type": "web_result"},
+                    {"title": item["title"]},
+                    {"url": item["url"]},
+                ]
+                if workflow_id:
+                    conditions.append({"workflow_id": workflow_id})
+
+                results = self.collection.get(
+                    where={"$and": conditions}
+                )
+
+                if results['ids']:
+                    self.collection.delete(ids=results['ids'])
+                    total_deleted += len(results['ids'])
+                    logger.info(
+                        f"🗑️ Deleted web result: {item['title'][:50]}... "
+                        f"({len(results['ids'])} chunks)"
+                    )
+
+            return total_deleted
+
+        except Exception as e:
+            logger.error(f"❌ Failed to delete web results: {e}")
+            return total_deleted
+
     def clear_all(self):
         """Clear all documents from the RAG system."""
         if not self.enabled:

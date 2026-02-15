@@ -218,13 +218,13 @@ ORIGINAL QUERY:
 {query}
 
 TASK CONTEXT:
-{task_context or "General data analysis task"}
+{task_context or "General information retrieval task"}
 
 The RAG contains:
-- Previous analysis results and summaries
-- Code execution outputs
-- Web search results about methodology
-- Uploaded documents
+- Uploaded documents and their content
+- Web search results from previous queries
+- Previous conversation summaries
+- Any other ingested knowledge
 
 Generate 3-5 diverse search queries that would find relevant information.
 Include:
@@ -398,7 +398,7 @@ ORIGINAL QUERY:
 {query}
 
 TASK CONTEXT:
-{task_context or "Data analysis task"}
+{task_context or "General information retrieval task"}
 
 RETRIEVED CONTEXT:
 {context[:3000]}
