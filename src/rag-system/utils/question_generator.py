@@ -20,6 +20,7 @@ import threading
 import time
 from typing import List, Optional
 
+from langchain_core.language_models.chat_models import BaseChatModel
 from loguru import logger
 
 
@@ -28,7 +29,9 @@ class QuestionGenerationWorker:
     Background worker that generates question embeddings for RAG chunks.
 
     Usage:
-        worker = QuestionGenerationWorker(rag, "http://...:11434", "qwen3:8b")
+        from rag_system.ai.llm_provider import get_llm, ProviderConfig
+        llm = get_llm(ProviderConfig(model="qwen3:8b", ...))
+        worker = QuestionGenerationWorker(rag, llm)
         worker.start()
         # When user needs the LLM:
         worker.pause()
@@ -55,13 +58,11 @@ class QuestionGenerationWorker:
     def __init__(
         self,
         rag,
-        ollama_base_url: str,
-        model: str = "qwen3:8b",
+        llm: BaseChatModel,
         llm_available: Optional[threading.Event] = None,
     ):
         self.rag = rag
-        self.ollama_base_url = ollama_base_url
-        self.model = model
+        self.llm = llm
 
         # Event: SET means LLM is free, CLEAR means user is using LLM
         self.llm_available = llm_available or threading.Event()
@@ -218,17 +219,10 @@ class QuestionGenerationWorker:
         return self._parse_questions(response)
 
     async def _call_llm(self, prompt: str) -> str:
-        """Make an async LLM call via langchain_ollama."""
-        from langchain_ollama import ChatOllama
+        """Make an async LLM call via the injected BaseChatModel."""
         from langchain.messages import HumanMessage
 
-        llm = ChatOllama(
-            model=self.model,
-            temperature=0.3,
-            base_url=self.ollama_base_url,
-        )
-
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
+        response = await self.llm.ainvoke([HumanMessage(content=prompt)])
         return response.content
 
     @staticmethod

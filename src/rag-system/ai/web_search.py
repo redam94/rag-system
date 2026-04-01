@@ -14,6 +14,18 @@ from typing import List, Optional, Callable, Any, Dict
 from loguru import logger
 
 from pydantic import BaseModel, Field
+from langchain_core.language_models.chat_models import BaseChatModel
+
+from .prompts import (
+    SEARCH_QUERY_GENERATOR,
+    SEARCH_RESULT_EVALUATOR,
+    SEARCH_SYNTHESIZER,
+    SEARCH_URL_SELECTOR,
+    SEARCH_QUERY_TEMPLATE,
+    SEARCH_EVALUATE_TEMPLATE,
+    SEARCH_SYNTHESIZE_TEMPLATE,
+    SEARCH_URL_SELECT_TEMPLATE,
+)
 
 # DuckDuckGo search
 try:
@@ -31,9 +43,8 @@ except ImportError:
     CRAWL4AI_AVAILABLE = False
     logger.warning("crawl4ai not installed")
 
-# LangChain for agent
+# LangChain messages
 try:
-    from langchain_ollama import ChatOllama
     from langchain.messages import SystemMessage, HumanMessage
     LANGCHAIN_AVAILABLE = True
 except ImportError:
@@ -112,34 +123,22 @@ class SearchSynthesis(BaseModel):
 class SearchAgent:
     """
     Agent that intelligently searches the web.
-    
+
     Uses an LLM to:
     1. Generate optimized search queries
     2. Evaluate results and refine queries
     3. Synthesize findings into actionable insights
     """
-    
+
     def __init__(
         self,
-        llm_model: str = "qwen3:30b",
-        base_url: str = "http://100.91.155.118:11434",
+        llm: Optional[BaseChatModel] = None,
         max_iterations: int = 2,
         results_per_query: int = 3
     ):
-        self.llm_model = llm_model
-        self.base_url = base_url
         self.max_iterations = max_iterations
         self.results_per_query = results_per_query
-        
-        if LANGCHAIN_AVAILABLE:
-            self.llm = ChatOllama(
-                model=llm_model,
-                temperature=0,
-                base_url=base_url
-            )
-        else:
-            self.llm = None
-            logger.warning("LangChain not available - using basic search")
+        self.llm = llm
     
     def generate_queries(
         self,
@@ -160,24 +159,14 @@ class SearchAgent:
         
         structured_llm = self.llm.with_structured_output(SearchQueries)
         
-        prompt = f"""Generate optimized web search queries to find information for the user's question.
-
-User's Question: {user_query}
-
-Additional Context:
-{context[:500] if context else "None provided"}
-
-Guidelines:
-- Create 2-4 specific, targeted search queries
-- Include relevant technical terms and domain-specific language when appropriate
-- One query should be broad, others more specific
-- Focus on finding accurate, authoritative information
-- Vary query phrasing to maximize coverage
-"""
+        prompt = SEARCH_QUERY_TEMPLATE.format(
+            user_query=user_query,
+            context=context[:500] if context else "None provided",
+        )
         
         try:
             result = structured_llm.invoke([
-                SystemMessage(content="You are a research assistant. Generate effective web search queries."),
+                SystemMessage(content=SEARCH_QUERY_GENERATOR),
                 HumanMessage(content=prompt)
             ])
             
@@ -220,31 +209,15 @@ Guidelines:
         
         structured_llm = self.llm.with_structured_output(RefinedQueries)
         
-        prompt = f"""Evaluate search results and determine if more searches are needed.
-
-Original Question: {original_query}
-
-Queries Already Used:
-{chr(10).join(f'- {q}' for q in queries_used)}
-
-Current Results:
-{results_summary}
-
-Determine:
-1. Are the results sufficient to answer the question?
-2. What information is missing?
-3. If insufficient, what 1-2 refined queries would help?
-
-Consider:
-- Depth and accuracy of information found
-- Whether key aspects of the question are covered
-- Authoritative sources (official docs, reputable references)
-- Practical details or examples if relevant
-"""
+        prompt = SEARCH_EVALUATE_TEMPLATE.format(
+            original_query=original_query,
+            queries_used=chr(10).join(f"- {q}" for q in queries_used),
+            results_summary=results_summary,
+        )
         
         try:
             result = structured_llm.invoke([
-                SystemMessage(content="Evaluate search results and suggest refinements."),
+                SystemMessage(content=SEARCH_RESULT_EVALUATOR),
                 HumanMessage(content=prompt)
             ])
             
@@ -289,22 +262,14 @@ Consider:
         
         structured_llm = self.llm.with_structured_output(SearchSynthesis)
         
-        prompt = f"""Synthesize these search results into actionable insights.
-
-Original Question: {original_query}
-
-Search Results:
-{results_text}
-
-Provide:
-1. A concise summary of key findings
-2. 3-5 specific, actionable insights
-3. A relevance score (0-1) for how well results answer the question
-"""
+        prompt = SEARCH_SYNTHESIZE_TEMPLATE.format(
+            original_query=original_query,
+            results_text=results_text,
+        )
         
         try:
             result = structured_llm.invoke([
-                SystemMessage(content="Synthesize web search results into insights."),
+                SystemMessage(content=SEARCH_SYNTHESIZER),
                 HumanMessage(content=prompt)
             ])
             
@@ -551,26 +516,16 @@ Provide:
             for i, r in enumerate(crawlable[:10])  # Max 10 candidates
         ])
         
-        prompt = f"""Select the {max_urls} most valuable URLs to crawl for detailed content.
-
-Original Query: {query}
-
-Available Results:
-{results_text}
-
-Selection Criteria:
-- Prioritize authoritative sources (official docs, reputable publications)
-- Prefer pages with detailed, in-depth content
-- Choose well-structured pages likely to have useful information
-- Avoid aggregator sites, forums with short answers
-- Prefer pages that directly address the query topic
-
-Return the indices of the {max_urls} best URLs to crawl."""
+        prompt = SEARCH_URL_SELECT_TEMPLATE.format(
+            max_urls=max_urls,
+            query=query,
+            results_text=results_text,
+        )
 
         try:
             structured_llm = self.llm.with_structured_output(UrlSelection)
             selection = structured_llm.invoke([
-                SystemMessage(content="Select the most valuable URLs to crawl for detailed content."),
+                SystemMessage(content=SEARCH_URL_SELECTOR),
                 HumanMessage(content=prompt)
             ])
             
@@ -814,41 +769,46 @@ async def search_analytics_methods(
     max_results: int = 5,
     use_agent: bool = True,
     context: str = "",
-    llm_model: str = "qwen3:30b",
-    base_url: str = "http://100.91.155.118:11434",
+    llm: Optional[BaseChatModel] = None,
     enrich_with_crawl: bool = True,
     max_crawl_urls: int = 3,
-    on_progress: Optional[Callable[[str], None]] = None
+    on_progress: Optional[Callable[[str], None]] = None,
+    # Deprecated kwargs kept for backward compat
+    llm_model: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> WebSearchContext:
     """
     Search for analytics methodology guidance using an intelligent agent.
-    
+
     Args:
         query: Search query
         max_results: Maximum number of results per query
         use_agent: Whether to use LLM agent for query optimization
         context: Additional context for query generation
-        llm_model: LLM model for agent
-        base_url: LLM base URL
+        llm: BaseChatModel instance for agent
         enrich_with_crawl: Whether to crawl top URLs for full content
         max_crawl_urls: Maximum number of URLs to crawl
         on_progress: Optional callback for progress updates
-        
+
     Returns:
         WebSearchContext with results
     """
+    # Backward compat: construct LLM from deprecated params if llm not provided
+    if llm is None and llm_model is not None:
+        from .llm_provider import get_llm, ProviderConfig
+        llm = get_llm(ProviderConfig(model=llm_model, base_url=base_url))
+
     if on_progress:
         on_progress(f"🌐 Starting web search: {query[:50]}...")
-    
+
     # Use agent-based search if available and enabled
-    if use_agent and LANGCHAIN_AVAILABLE and DDGS_AVAILABLE:
+    if use_agent and LANGCHAIN_AVAILABLE and DDGS_AVAILABLE and llm is not None:
         agent = SearchAgent(
-            llm_model=llm_model,
-            base_url=base_url,
+            llm=llm,
             max_iterations=2,
             results_per_query=max_results
         )
-        
+
         return await agent.search(
             query,
             context,
@@ -945,34 +905,37 @@ def format_search_results(
 async def search_and_synthesize(
     query: str,
     context: str = "",
-    llm_model: str = "qwen3:30b",
-    base_url: str = "http://100.91.155.118:11434",
+    llm: Optional[BaseChatModel] = None,
     enrich_with_crawl: bool = True,
     max_crawl_urls: int = 3,
-    on_progress: Optional[Callable[[str], None]] = None
+    on_progress: Optional[Callable[[str], None]] = None,
+    # Deprecated kwargs kept for backward compat
+    llm_model: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Perform agent-based search and synthesize results.
-    
+
     Args:
         query: Search query
         context: Additional context for query generation
-        llm_model: LLM model for agent
-        base_url: LLM base URL
+        llm: BaseChatModel instance for agent
         enrich_with_crawl: Whether to use crawl4ai to get full page content
         max_crawl_urls: Maximum URLs to crawl for enrichment
         on_progress: Optional callback for progress updates
-    
+
     Returns a dictionary with:
     - results: List of SearchResult
     - synthesis: SearchSynthesis object
     - queries_used: List of queries executed
     - formatted_text: Ready-to-use text summary
     """
-    agent = SearchAgent(
-        llm_model=llm_model,
-        base_url=base_url
-    )
+    # Backward compat: construct LLM from deprecated params if llm not provided
+    if llm is None and llm_model is not None:
+        from .llm_provider import get_llm as provider_get_llm, ProviderConfig
+        llm = provider_get_llm(ProviderConfig(model=llm_model, base_url=base_url))
+
+    agent = SearchAgent(llm=llm)
     
     # Run search with optional crawl enrichment
     ctx = await agent.search(

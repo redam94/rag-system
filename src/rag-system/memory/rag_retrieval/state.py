@@ -8,6 +8,7 @@ Tracks:
 - Configuration
 """
 
+import os
 from typing import TypedDict, List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
@@ -20,51 +21,53 @@ class RetrievedChunk:
     metadata: Dict[str, Any]
     relevance_score: float
     query_used: str
-    
+    recency_score: float = 0.5
+    combined_score: float = 0.0
+
     def __hash__(self):
         return hash(self.content[:100])
 
 
-@dataclass 
+@dataclass
 class QueryTask:
     """A query task in the todo list."""
     query: str
-    query_type: str  # specific, broad, subtopic, refined
+    query_type: str  # specific, broad, subtopic, refined, broadened
     priority: int = 1  # Higher = more important
     parent_query: Optional[str] = None  # Query that spawned this one
 
 
 class RetrievalState(TypedDict, total=False):
     """State for RAG retrieval workflow."""
-    
+
     # Input
     original_query: str
     workflow_id: str
-    
+
     # Query management
     query_todo: List[QueryTask]
     completed_queries: List[str]
     current_query: Optional[QueryTask]
     rewritten_query: Optional[str]
-    
+
     # Subtopic tracking
     discovered_subtopics: List[str]
     explored_subtopics: List[str]
-    
+
     # Retrieved context
     retrieved_chunks: List[RetrievedChunk]
     relevant_chunks: List[RetrievedChunk]  # Chunks that passed grading
-    
+
     # Grading state
     last_grade_score: float
     total_relevant_found: int
     consecutive_low_relevance: int  # Track iterations without good results
-    
+
     # Output
     synthesized_context: str
     key_findings: List[str]
     document_types_found: List[str]
-    
+
     # Control
     iteration: int
     max_iterations: int
@@ -75,7 +78,7 @@ class RetrievalState(TypedDict, total=False):
 @dataclass
 class RetrievalConfig:
     """Configuration for retrieval workflow."""
-    
+
     max_iterations: int = 10
     max_chunks_per_query: int = 20
     max_total_chunks: int = 100
@@ -83,10 +86,17 @@ class RetrievalConfig:
     max_consecutive_low_relevance: int = 5
     max_subtopics_to_explore: int = 5
     max_context_chars: int = 20_000
-    
+
+    # Scoring weights
+    relevance_weight: float = 0.6
+    recency_weight: float = 0.4
+    recency_decay_days: int = 30
+
     # LLM settings
-    llm_model: str = "qwen3:30b"
-    base_url: str = "http://100.91.155.118:11434"
+    provider: str = field(default_factory=lambda: os.getenv("LLM_PROVIDER", "ollama"))
+    llm_model: str = field(default_factory=lambda: os.getenv("LLM_MODEL", "qwen3:30b"))
+    base_url: str = field(default_factory=lambda: os.getenv("LLM_BASE_URL", "http://100.91.155.118:11434"))
+    api_key: str = field(default_factory=lambda: os.getenv("LLM_API_KEY", ""))
 
 
 # Type alias for dependencies
@@ -103,7 +113,7 @@ def create_initial_state(
 ) -> RetrievalState:
     """Create initial state for retrieval workflow."""
     cfg = config or RetrievalConfig()
-    
+
     return RetrievalState(
         original_query=query,
         workflow_id=workflow_id,
