@@ -39,6 +39,10 @@ async def gather_rag_context(
         max_chunks_per_query=30,
         max_total_chunks=50,
         max_context_chars=8000,
+        provider=deps.get("provider", DEFAULTS["provider"]),
+        llm_model=deps.get("llm", DEFAULTS["llm"]),
+        base_url=deps.get("base_url", DEFAULTS["base_url"]),
+        api_key=deps.get("api_key", DEFAULTS.get("api_key", "")),
     )
 
     try:

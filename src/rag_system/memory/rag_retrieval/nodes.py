@@ -164,16 +164,14 @@ async def execute_query(state: RetrievalState, runtime: Runtime[Deps]) -> Dict[s
         return {"error": "RAG not available"}
 
     config: RetrievalConfig = deps.get("config", RetrievalConfig())
-    workflow_id = state.get("workflow_id")
 
     try:
-        # Query RAG
+        # Query RAG without workflow_id filter so uploaded documents are found
         results = []
         for q in queries:
             results.extend(rag.query_relevant_context(
                 query=q,
                 n_results=config.max_chunks_per_query,
-                workflow_id=workflow_id,
             ))
 
         # Convert to RetrievedChunk objects with scoring
